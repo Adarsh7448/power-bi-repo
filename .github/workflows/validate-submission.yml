@@ -9,8 +9,6 @@ permissions:
   contents: read
 
 env:
-  # ---- Submission window in UTC ----
-  # Example placeholders — CHANGE THESE to your real window.
   SUBMISSION_START_UTC: "2026-01-23T04:30:00Z"
   SUBMISSION_END_UTC:   "2026-01-26T18:29:00Z"
 
@@ -18,11 +16,13 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate issue format, acknowledge, and enforce submission window
+      - name: Validate submission (close ONLY if created after deadline)
         uses: actions/github-script@v7
         with:
           script: |
             const issue = context.payload.issue;
+            const action = context.payload.action;
+
             const title = issue.title || "";
             const body = issue.body || "";
             const createdAt = new Date(issue.created_at);
@@ -34,80 +34,104 @@ jobs:
             const repo = context.repo.repo;
             const issue_number = issue.number;
 
-            // Labels (create these once in repo settings)
+            // Labels
             const validLabel = "submission:valid";
             const fixLabel = "submission:needs-fix";
             const reviewLabel = "awaiting-review";
-            const windowLabel = "submission:closed-window";
+            const lateLabel = "submission:late";
 
-            // ---- 1) Enforce submission window (only on OPENED/REOPENED) ----
-            // If you want it to also enforce on edits, remove the event check.
-            const eventAction = context.payload.action;
+            // -----------------------------
+            // 1) HARD RULE: Close ONLY if issue is OPENED after deadline
+            // -----------------------------
+            if (action === "opened" && createdAt > end) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number,
+                labels: [lateLabel]
+              });
 
-            if ((eventAction === "opened" || eventAction === "reopened") &&
-                (createdAt < start || createdAt > end)) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number,
+                body:
+                  `⛔ **Submission closed – Deadline passed**\n\n` +
+                  `This issue was created at **${issue.created_at} (UTC)**, which is **after the submission deadline**.\n\n` +
+                  `Deadline (UTC): **${process.env.SUBMISSION_END_UTC}**\n\n` +
+                  `If you believe this is an error, please contact the instructor.\n\n` +
+                  `— Automated check`
+              });
 
-              const msg =
-                `⛔ **Submission window is closed**\n\n` +
-                `This issue was created at **${issue.created_at} (UTC)**, which is outside the allowed submission period.\n\n` +
-                `Allowed window (UTC):\n` +
-                `- Start: **${process.env.SUBMISSION_START_UTC}**\n` +
-                `- End: **${process.env.SUBMISSION_END_UTC}**\n\n` +
-                `Please submit again within the allowed time window.\n\n` +
-                `— Automated check`;
-
-              try { await github.rest.issues.addLabels({owner, repo, issue_number, labels: [windowLabel]}); } catch (e) {}
-              await github.rest.issues.createComment({owner, repo, issue_number, body: msg});
-
-              // Close the issue
-              await github.rest.issues.update({owner, repo, issue_number, state: "closed"});
-
-              // Optional: lock conversation to avoid back-and-forth
-              // await github.rest.issues.lock({owner, repo, issue_number, lock_reason: "resolved"});
+              await github.rest.issues.update({
+                owner, repo, issue_number,
+                state: "closed"
+              });
 
               return;
             }
 
-            // ---- 2) Validate title format: Power BI Assignment – 2xfx00xxxx ----
-            // Student ID regex: ^2[0-9]f[0-9]00[0-9]{4}$
-            const titleOk = /^Power BI Assignment\s*(–|-)\s*2[0-9]f[0-9]00[0-9]{4}$/.test(title);
+            // -----------------------------
+            // 2) From here on: NO AUTO-CLOSE
+            // -----------------------------
 
-            // ---- 3) Validate required artifacts in body ----
-            const imageCount = (body.match(/!\[.*?\]\(https?:\/\/.*?\)/g) || []).length;
+            // Title validation
+            const titleOk =
+              /^Power BI Assignment\s*(–|-)\s*2[0-9]f[0-9]00[0-9]{4}$/.test(title);
 
-            // PBIX attached OR link included
-            const hasLink = /(https?:\/\/\S+)/i.test(body);
-            const mentionsPbix = /\.pbix/i.test(body) || /pbix/i.test(body);
+            // Artifact checks
+            const imageCount =
+              (body.match(/!\[.*?\]\(https?:\/\/.*?\)/g) || []).length;
 
-            // Expect at least 2 screenshots: report + model (adjust if you want stricter)
             const screenshotsOk = imageCount >= 2;
 
-            const pbixOk = mentionsPbix || hasLink;
+            const hasLink = /(https?:\/\/\S+)/i.test(body);
+            const mentionsPbix = /\.pbix/i.test(body) || /pbix/i.test(body);
+            const pbixOk = hasLink || mentionsPbix;
 
             const problems = [];
-            if (!titleOk) problems.push("**Title format** should be: `Power BI Assignment – 2xfx00xxxx` (example: `Power BI Assignment – 21f3001234`).");
-            if (!screenshotsOk) problems.push("Please include **at least 2 screenshots** (1 report page + 1 model view).");
-            if (!pbixOk) problems.push("Please attach the **.pbix** file or paste a **Drive/OneDrive link** to it.");
+            if (!titleOk)
+              problems.push("**Title format** must be `Power BI Assignment – 2xfx00xxxx`.");
+            if (!screenshotsOk)
+              problems.push("Please include **at least 2 screenshots** (Report + Model view).");
+            if (!pbixOk)
+              problems.push("Please attach the **.pbix** file or provide a valid link.");
 
-            // ---- 4) Comment + label ----
+            // -----------------------------
+            // 3) Label + feedback (editable)
+            // -----------------------------
             if (problems.length === 0) {
-              try { await github.rest.issues.addLabels({owner, repo, issue_number, labels: [validLabel, reviewLabel]}); } catch (e) {}
-              try { await github.rest.issues.removeLabel({owner, repo, issue_number, name: fixLabel}); } catch (e) {}
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number,
+                labels: [validLabel, reviewLabel]
+              }).catch(() => {});
 
-              const msg =
-                `✅ **Submission received!**\n\n` +
-                `Your submission matches the required title format and includes the expected artifacts.\n\n` +
-                `Next: I’ll review and share feedback here.\n\n` +
-                `— Automated check`;
-              await github.rest.issues.createComment({owner, repo, issue_number, body: msg});
+              await github.rest.issues.removeLabel({
+                owner, repo, issue_number,
+                name: fixLabel
+              }).catch(() => {});
+
+              await github.rest.issues.createComment({
+                owner, repo, issue_number,
+                body:
+                  `✅ **Submission received successfully**\n\n` +
+                  `Your submission meets the required format and includes all required artifacts.\n\n` +
+                  `I will review this and share feedback here.\n\n` +
+                  `— Automated check`
+              });
             } else {
-              try { await github.rest.issues.addLabels({owner, repo, issue_number, labels: [fixLabel]}); } catch (e) {}
-              try { await github.rest.issues.removeLabel({owner, repo, issue_number, name: validLabel}); } catch (e) {}
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number,
+                labels: [fixLabel]
+              }).catch(() => {});
 
-              const msg =
-                `⚠️ **Submission received, but needs a small fix**\n\n` +
-                problems.map(p => `- ${p}`).join("\n") +
-                `\n\nPlease edit this issue to update the missing items. Once fixed, the bot will re-check.\n\n` +
-                `— Automated check`;
-              await github.rest.issues.createComment({owner, repo, issue_number, body: msg});
+              await github.rest.issues.removeLabel({
+                owner, repo, issue_number,
+                name: validLabel
+              }).catch(() => {});
+
+              await github.rest.issues.createComment({
+                owner, repo, issue_number,
+                body:
+                  `⚠️ **Submission needs updates**\n\n` +
+                  problems.map(p => `- ${p}`).join("\n") +
+                  `\n\n👉 Please **edit this same issue** to fix the above. No need to create a new issue.\n\n` +
+                  `— Automated check`
+              });
             }
